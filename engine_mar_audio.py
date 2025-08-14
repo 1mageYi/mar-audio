@@ -11,7 +11,19 @@ import numpy as np
 
 import util.misc as misc
 import util.lr_sched as lr_sched
-from util.ema import update_ema
+
+
+def update_ema(target_params, source_params, rate=0.99):
+    """
+    Update target parameters to be closer to those of source parameters using
+    an exponential moving average.
+
+    :param target_params: the target parameter sequence.
+    :param source_params: the source parameter sequence.
+    :param rate: the EMA rate (closer to 1 means slower).
+    """
+    for targ, src in zip(target_params, source_params):
+        targ.detach().mul_(rate).add_(src, alpha=1 - rate)
 
 def train_one_epoch(model: torch.nn.Module, vae: torch.nn.Module,
                     model_params: Iterable, ema_params: Iterable,
@@ -81,7 +93,7 @@ def train_one_epoch(model: torch.nn.Module, vae: torch.nn.Module,
 
 
 @torch.no_grad()
-def evaluate(model_without_ddp: torch.nn.Module, vae: torch.nn.Module, tokenizer,
+def evaluate(model_without_ddp: torch.nn.Module, vae: torch.nn.Module, ema_params: Iterable, tokenizer,
              args, epoch: int, log_writer=None, use_ema=True):
     model_without_ddp.eval()
 

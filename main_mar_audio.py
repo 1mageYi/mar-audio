@@ -1,265 +1,233 @@
-# main_mar.py
-
+# mar_audio_main.py
 import argparse
+import datetime
 import numpy as np
 import os
 import time
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-import torchaudio
+from pathlib import Path
 
-# 导入你的模型和数据加载器
-from models.mar import mar_models
-from models.diffloss import DiffLoss
-from models.audio_vae import AudioVAE
-from data.audio_dataset import AudioDataset
+import torch
+import torch.backends.cudnn as cudnn
+from torch.utils.tensorboard import SummaryWriter
+from transformers import T5Tokenizer
+
+import util.misc as misc
+from util.misc import NativeScalerWithGradNormCount as NativeScaler
+from dataset.dataset_audio import AudioTextDataset # <-- 导入新的数据集类
+from models.vae_audio import VAEWrapper # <-- 导入你的 VAE Wrapper
+from models.mar_audio import mar_audio_large # <-- 导入新的音频MAR模型
+from engine_mar_audio import train_one_epoch, evaluate # <-- 导入新的引擎
+import copy
 
 def get_args_parser():
-    parser = argparse.ArgumentParser('MAR for Audio Generation', add_help=False)
-
-    # -- 模型参数 --
-    parser.add_argument('--model', default='mar_base', type=str, metavar='MODEL',
-                        help=f'Name of model to train: {", ".join(mar_models.keys())}')
-    parser.add_argument('--max_seq_len', default=1024, type=int, help='Max sequence length of VAE latent')
-    parser.add_argument('--latent_dim', default=64, type=int, help='Dimension of VAE latent space')
-    parser.add_argument('--audio_vae_path', type=str, required=True, help='Path to your pretrained audio VAE model')
-
-    # -- DiffLoss 参数 --
-    parser.add_argument('--diffloss_d', default=3, type=int, help='Depth of DiffLoss MLP')
-    parser.add_argument('--diffloss_w', default=1024, type=int, help='Width of DiffLoss MLP')
-
-    # -- 训练参数 --
+    parser = argparse.ArgumentParser('MAR-Audio training with Diffusion Loss', add_help=False)
+    parser.add_argument('--batch_size', default=8, type=int,
+                        help='Batch size per GPU (effective batch size is batch_size * # gpus)')
     parser.add_argument('--epochs', default=200, type=int)
-    parser.add_argument('--batch_size', default=32, type=int)
-    parser.add_argument('--lr', type=float, default=1e-4, metavar='LR', help='learning rate')
-    parser.add_argument('--mask_ratio', default=0.5, type=float, help='Masking ratio for training')
-    
-    # -- 数据集参数 --
-    parser.add_argument('--data_path', type=str, required=True, help='path to your audio dataset')
-    parser.add_argument('--sample_rate', type=int, default=16000, help='Audio sample rate')
-    parser.add_argument('--duration', type=int, default=10, help='Audio duration in seconds')
-    
-    # -- 其他 --
-    parser.add_argument('--output_dir', default='./output_dir', help='path where to save checkpoints')
-    parser.add_argument('--device', default='cuda', help='device to use for training / testing')
-    parser.add_argument('--seed', default=42, type=int)
-    parser.add_argument('--num_workers', default=4, type=int)
+
+    # Model parameters
+    parser.add_argument('--model', default='mar_audio_large', type=str, metavar='MODEL',
+                        help='Name of model to train')
+    parser.add_argument('--max_seq_len', default=1024, type=int, help='Max sequence length of audio latents')
+    parser.add_argument('--audio_embed_dim', default=64, type=int, help='Audio VAE latent embedding dimension')
+
+    # VAE parameters
+    parser.add_argument('--vae_config_path', default="configs/stable_audio_2_0_vae.json", type=str, help='Path to VAE config')
+    parser.add_argument('--vae_ckpt_path', default="pretrained_models/vae/stable_audio_open_vae_weights.pth", type=str, help='Path to VAE checkpoint') #
+
+    # Text Tokenizer parameters
+    parser.add_argument('--tokenizer_path', default='t5-base', type=str, help='Path or name of T5 tokenizer')
+    parser.add_argument('--max_text_len', default=128, type=int, help='Max length for text tokens')
+
+    # Generation parameters
+    parser.add_argument('--num_iter', default=64, type=int, help='Number of autoregressive iterations for generation')
+    parser.add_argument('--num_eval_samples', default=10, type=int, help='Number of samples to generate for evaluation')
+    parser.add_argument('--cfg_scale', default=4.0, type=float, help="Classifier-free guidance scale")
+    parser.add_argument('--uncond_prob', default=0.1, type=float, help='Probability of unconditional training for CFG')
+    parser.add_argument('--eval_freq', type=int, default=20, help='Evaluation frequency')
+    parser.add_argument('--save_last_freq', type=int, default=5, help='Save last checkpoint frequency')
     parser.add_argument('--evaluate', action='store_true', help='Perform evaluation only')
-    parser.add_argument('--num_samples', type=int, default=10, help='Number of samples to generate during evaluation')
+    parser.add_argument('--eval_bsz', type=int, default=4, help='Generation batch size for evaluation')
+
+    # Optimizer parameters
+    parser.add_argument('--weight_decay', type=float, default=0.02, help='Weight decay (default: 0.02)')
+    parser.add_argument('--grad_checkpointing', action='store_true', help='Enable gradient checkpointing')
+    parser.add_argument('--lr', type=float, default=None, metavar='LR', help='Learning rate (absolute lr)')
+    parser.add_argument('--blr', type=float, default=1e-4, metavar='LR', help='Base learning rate: absolute_lr = base_lr * total_batch_size / 256')
+    parser.add_argument('--min_lr', type=float, default=0., metavar='LR', help='Lower lr bound for cyclic schedulers')
+    parser.add_argument('--warmup_epochs', type=int, default=40, metavar='N', help='Epochs to warmup LR')
+    parser.add_argument('--ema_rate', default=0.9999, type=float)
+
+    # Diffusion & MAR params (can be kept as in the original)
+    parser.add_argument('--mask_ratio_min', type=float, default=0.5, help='Minimum mask ratio')
+    parser.add_argument('--grad_clip', type=float, default=3.0, help='Gradient clip')
+    parser.add_argument('--diffloss_d', type=int, default=12)
+    parser.add_argument('--diffloss_w', type=int, default=1536)
+    parser.add_argument('--num_sampling_steps', type=str, default="100")
+    parser.add_argument('--temperature', default=1.0, type=float, help='Diffusion loss sampling temperature')
+
+    # Dataset parameters
+    parser.add_argument('--data_path', default='./dummy_data.txt', type=str,
+                        help='Path to a text file containing (audio_path, text) pairs, one per line, separated by a tab.')
+
+    parser.add_argument('--output_dir', default='./output_dir_audio',
+                        help='Path where to save, empty for no saving')
+    parser.add_argument('--device', default='cuda',
+                        help='Device to use for training / testing')
+    parser.add_argument('--seed', default=1, type=int)
+    parser.add_argument('--resume', default='',
+                        help='Resume from checkpoint')
+    parser.add_argument('--start_epoch', default=0, type=int, metavar='N', help='Start epoch')
+    parser.add_argument('--num_workers', default=4, type=int)
+    parser.add_argument('--pin_mem', action='store_true', help='Pin CPU memory in DataLoader')
+    parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
+    parser.set_defaults(pin_mem=True)
+
+    # distributed training parameters
+    parser.add_argument('--world_size', default=1, type=int, help='Number of distributed processes')
+    parser.add_argument('--local_rank', default=-1, type=int)
+    parser.add_argument('--dist_on_itp', action='store_true')
+    parser.add_argument('--dist_url', default='env://', help='Url used to set up distributed training')
 
     return parser
 
 
 def main(args):
-    # ---- 设置环境 ----
+    misc.init_distributed_mode(args)
+    print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
+    print("{}".format(args).replace(', ', ',\n'))
+
     device = torch.device(args.device)
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    os.makedirs(args.output_dir, exist_ok=True)
+    seed = args.seed + misc.get_rank()
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    cudnn.benchmark = True
 
-    # ---- 加载模型 ----
-    print("Loading models...")
-    # 1. 加载你的音频 VAE
-    vae = AudioVAE(model_path=args.audio_vae_path).to(device)
-    vae.eval() # VAE不参与训练
+    # === Setup logging ===
+    if misc.is_main_process():
+        os.makedirs(args.output_dir, exist_ok=True)
+        log_writer = SummaryWriter(log_dir=args.output_dir)
+    else:
+        log_writer = None
 
-    # 2. 实例化 MAR 模型
-    mar_model = mar_models[args.model](
-        max_seq_len=args.max_seq_len,
-        latent_dim=args.latent_dim,
-    ).to(device)
+    # === Setup VAE, Tokenizer ===
+    print("Initializing VAE, Tokenizer...")
+    vae = VAEWrapper(model_config_path=args.vae_config_path, model_ckpt_path=args.vae_ckpt_path, device=device) #
+    tokenizer = T5Tokenizer.from_pretrained(args.tokenizer_path, model_max_length=args.max_text_len)
 
-    # 3. 实例化 DiffLoss
-    loss_func = DiffLoss(
-        target_channels=args.latent_dim,
-        z_channels=mar_model.embed_dim, # DiffLoss以MAR的隐藏状态为条件
-        depth=args.diffloss_d,
-        width=args.diffloss_w,
-        num_sampling_steps=256 # 默认值，可以调整
-    ).to(device)
+    # === Setup Dataset ===
+    # This is a placeholder for your actual data loading.
+    # Create a text file `dummy_data.txt` with lines like:
+    # path/to/audio1.wav	a dog is barking
+    # path/to/audio2.wav	techno music with a heavy bassline
+    print("Loading data...")
+    try:
+        with open(args.data_path, 'r', encoding='utf-8') as f:
+            audio_text_pairs = [line.strip().split('\t') for line in f]
+    except FileNotFoundError:
+        print(f"Warning: Data file not found at {args.data_path}. Using placeholder data.")
+        print("Please create a tab-separated file with audio paths and text prompts.")
+        # Create a dummy file for demonstration
+        with open(args.data_path, 'w') as f:
+            f.write("placeholder.wav\tthis is a test prompt\n")
+        if not os.path.exists("placeholder.wav"):
+            # Create a silent wav file
+            import soundfile as sf
+            sf.write("placeholder.wav", np.zeros(44100), 44100)
+        audio_text_pairs = [("placeholder.wav", "this is a test prompt")]
 
-    # 将 MAR 和 DiffLoss 的参数合并给优化器
-    optimizer = torch.optim.AdamW(
-        list(mar_model.parameters()) + list(loss_func.parameters()),
-        lr=args.lr
+
+    dataset_train = AudioTextDataset(data=audio_text_pairs, tokenizer=tokenizer, max_text_len=args.max_text_len)
+    print(dataset_train)
+
+    sampler_train = torch.utils.data.DistributedSampler(
+        dataset_train, num_replicas=misc.get_world_size(), rank=misc.get_rank(), shuffle=True
     )
-    
-    print(f"MAR Model: {args.model}")
-    print(f"Total parameters: {sum(p.numel() for p in mar_model.parameters() if p.requires_grad)/1e6:.2f}M")
-    print(f"DiffLoss parameters: {sum(p.numel() for p in loss_func.parameters() if p.requires_grad)/1e6:.2f}M")
-
-
-    # ---- 加载数据 ----
-    print("Loading dataset...")
-    dataset = AudioDataset(
-        root_dir=args.data_path,
-        max_duration_secs=args.duration,
-        sample_rate=args.sample_rate
-    )
-    data_loader = DataLoader(
-        dataset,
+    data_loader_train = torch.utils.data.DataLoader(
+        dataset_train, sampler=sampler_train,
         batch_size=args.batch_size,
-        shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True
+        pin_memory=args.pin_mem,
+        drop_last=True,
     )
 
-    # ---- 如果是评估模式 ----
+    # === Setup Model ===
+    print(f"Creating model: {args.model}")
+    model = mar_audio_large(
+        max_seq_len=args.max_seq_len,
+        audio_embed_dim=args.audio_embed_dim,
+        vocab_size=tokenizer.vocab_size,
+        diffloss_d=args.diffloss_d,
+        diffloss_w=args.diffloss_w,
+        num_sampling_steps=args.num_sampling_steps,
+        grad_checkpointing=args.grad_checkpointing,
+    )
+    model.to(device)
+    model_without_ddp = model
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print("Number of trainable parameters: {}M".format(n_params / 1e6))
+
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank])
+        model_without_ddp = model.module
+
+    # === Setup Optimizer ===
+    eff_batch_size = args.batch_size * misc.get_world_size()
+    if args.lr is None:
+        args.lr = args.blr * eff_batch_size / 256
+    print(f"Effective batch size: {eff_batch_size}")
+    print(f"Learning rate: {args.lr:.2e}")
+
+    param_groups = misc.add_weight_decay(model_without_ddp, args.weight_decay)
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+    loss_scaler = NativeScaler()
+
+    # === Resume from checkpoint ===
+    model_params = list(model_without_ddp.parameters())
+    ema_params = copy.deepcopy(model_params)
+
+    misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler, ema_params=ema_params)
+
     if args.evaluate:
-        print("Running in evaluation mode...")
-        generate_samples(mar_model, vae, args.num_samples, device, args)
+        print("Running evaluation only.")
+        evaluate(model_without_ddp, vae, tokenizer, args, 0, log_writer=log_writer)
         return
 
-    # ---- 训练循环 ----
+    # === Training Loop ===
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
-
-    for epoch in range(args.epochs):
-        mar_model.train()
-        loss_func.train()
+    for epoch in range(args.start_epoch, args.epochs):
+        if args.distributed:
+            data_loader_train.sampler.set_epoch(epoch)
         
-        total_loss = 0
-        for step, audio_wave in enumerate(data_loader):
-            audio_wave = audio_wave.to(device)
+        train_one_epoch(
+            model, vae,
+            model_params, ema_params,
+            data_loader_train,
+            optimizer, device, epoch, loss_scaler,
+            log_writer=log_writer,
+            args=args
+        )
 
-            # 1. 使用 VAE 获取潜空间表示
-            with torch.no_grad():
-                z = vae.encode(audio_wave) # Shape: [B, D, L]
+        if epoch % args.save_last_freq == 0 or epoch + 1 == args.epochs:
+            misc.save_model(
+                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+                loss_scaler=loss_scaler, epoch=epoch, ema_params=ema_params, epoch_name="last"
+            )
 
-            # 2. *** 这是 MAR 训练的核心：随机掩码 ***
-            B, D, L = z.shape
-            
-            # 生成一个随机的序列顺序
-            noise = torch.rand(B, L, device=device)
-            ids_shuffle = torch.argsort(noise, dim=1)
-            ids_restore = torch.argsort(ids_shuffle, dim=1)
-
-            # 决定要保留多少作为上下文（不被掩码）
-            len_keep = int(L * (1 - args.mask_ratio))
-            
-            # 得到上下文的索引和被掩码的索引
-            ids_keep = ids_shuffle[:, :len_keep]
-            ids_mask = ids_shuffle[:, len_keep:]
-            
-            # 从原始潜变量 z 中，根据索引选出上下文部分
-            # 首先调整 z 的维度以方便索引: [B, D, L] -> [B, L, D]
-            z_permuted = z.permute(0, 2, 1)
-            z_context = torch.gather(z_permuted, dim=1, index=ids_keep.unsqueeze(-1).expand(-1, -1, D))
-
-            # 3. 通过 MAR 模型处理上下文
-            # 注意：这里没有传入 mask 参数，因为上下文内部是双向可见的！
-            mar_output = mar_model.forward_encoder(z_context.permute(0, 2, 1), cond=None, mask=None)
-
-            # 4. 计算 DiffLoss
-            # 目标是让模型根据上下文预测出被掩码的部分
-            # 收集被掩码的目标潜变量 (ground truth)
-            target_masked = torch.gather(z_permuted, dim=1, index=ids_mask.unsqueeze(-1).expand(-1, -1, D))
-            
-            # 收集对应的 MAR 模型输出
-            pred_masked = torch.gather(mar_output, dim=1, index(ids_mask.unsqueeze(-1).expand(-1, -1, mar_model.embed_dim)))
-
-            # 计算损失
-            loss = loss_func(target=target_masked, z=pred_masked)
-            
-            # 5. 反向传播
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-            
-            if step % 50 == 0:
-                print(f"Epoch: {epoch}, Step: {step}, Loss: {loss.item():.4f}")
-
-        avg_loss = total_loss / len(data_loader)
-        print(f"--- Epoch {epoch} finished. Average Loss: {avg_loss:.4f} ---")
-        
-        # 保存 checkpoint
-        if (epoch + 1) % 10 == 0:
-            checkpoint_path = os.path.join(args.output_dir, f'checkpoint-epoch-{epoch+1}.pth')
-            torch.save({
-                'mar_model': mar_model.state_dict(),
-                'diffloss': loss_func.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'args': args,
-            }, checkpoint_path)
-            print(f"Checkpoint saved to {checkpoint_path}")
-
+        if epoch % args.eval_freq == 0 or epoch + 1 == args.epochs:
+            torch.cuda.empty_cache()
+            evaluate(model_without_ddp, vae, tokenizer, args, epoch, log_writer=log_writer)
+            torch.cuda.empty_cache()
 
     total_time = time.time() - start_time
-    print(f"Training finished in {total_time/3600:.2f} hours")
-
-
-@torch.no_grad()
-def generate_samples(mar_model, vae, num_samples, device, args):
-    """
-    使用自回归方式生成样本
-    """
-    mar_model.eval()
-    
-    # 准备一个随机的起始序列（这里用零初始化）
-    B, D, L = num_samples, args.latent_dim, args.max_seq_len
-    z_generated = torch.zeros(B, D, L, device=device)
-    
-    # 生成随机的生成顺序
-    ids_shuffle = torch.argsort(torch.rand(B, L, device=device), dim=1)
-    
-    print("Starting autoregressive generation...")
-    for step in range(L):
-        # 当前要生成的 token 的索引
-        current_ids = ids_shuffle[:, step:step+1]
-        
-        # 已经生成的 token 作为上下文
-        context_ids = ids_shuffle[:, :step]
-        
-        if step == 0:
-            # 第一步没有上下文，可以传入一个可学习的起始 token 或零向量
-            context_mar_input = torch.zeros(B, D, 0, device=device)
-        else:
-            # 从已生成的 z_generated 中收集上下文
-            context_z = torch.gather(z_generated.permute(0,2,1), dim=1, index=context_ids.unsqueeze(-1).expand(-1,-1,D))
-            context_mar_input = context_z.permute(0,2,1)
-
-        # 使用 MAR 模型处理上下文
-        mar_output = mar_model.forward_encoder(context_mar_input, cond=None, mask=None)
-
-        # 采样 (这里为了简单直接取模型输出，实际应使用 DiffLoss 的 sample 方法)
-        # 假设要预测的位置的 MAR 输出为
-        if step == 0:
-            # 假设第一个输出对应第一个预测
-            pred_hidden_state = mar_output[:, 0, :]
-        else:
-            # 在MAR输出中找到对应当前要生成位置的输出
-            # 这部分逻辑较为复杂，简化处理：总是取最后一个输出
-            pred_hidden_state = mar_output[:, -1, :]
-            
-        # *** 此处应调用 DiffLoss.sample() 来获得更真实的采样 ***
-        # 为了简化，我们直接用 MAR 的 head 来做一个粗略的预测
-        pred_z_value = mar_model.head(pred_hidden_state) # Shape: [B, D]
-
-        # 将预测出的值填充到 z_generated 的对应位置
-        # scatter_ 方法可以在指定索引上填充值
-        z_generated.permute(0,2,1).scatter_(dim=1, index=current_ids.unsqueeze(-1).expand(-1,-1,D), src=pred_z_value.unsqueeze(1))
-        
-        if (step + 1) % 100 == 0:
-            print(f"Generated {step+1}/{L} tokens...")
-            
-    print("Generation finished. Decoding with VAE...")
-    # 使用 VAE 解码
-    generated_audio = vae.decode(z_generated)
-    
-    # 保存音频
-    save_dir = os.path.join(args.output_dir, "samples")
-    os.makedirs(save_dir, exist_ok=True)
-    for i in range(num_samples):
-        file_path = os.path.join(save_dir, f"generated_sample_{i}.wav")
-        torchaudio.save(file_path, generated_audio[i].cpu(), args.sample_rate)
-        print(f"Saved to {file_path}")
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    print('Training time {}'.format(total_time_str))
 
 
 if __name__ == '__main__':
-    args = get_args_parser()
-    args = args.parse_args()
+    args = get_args_parser().parse_args()
+    if args.output_dir:
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
