@@ -339,7 +339,7 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler, ema_params):
             print(f"No checkpoint found at '{args.resume}', starting from scratch.")
     else:
         print("No resume path provided, starting from scratch.")
-        
+
 def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler, ema_params=None, epoch_name=None):
     if epoch_name is None:
         epoch_name = str(epoch)
@@ -375,3 +375,43 @@ def all_reduce_mean(x):
         return x_reduce.item()
     else:
         return x
+    
+
+
+def update_ema(target_params, source_params, rate=0.999):
+    """
+    用指数移动平均更新目标参数（教师模型）。
+    在每次训练迭代后调用。
+    """
+    for targ, src in zip(target_params, source_params):
+        targ.detach().mul_(rate).add_(src.detach(), alpha=1 - rate)
+
+
+def load_ema_to_model(model, ema_params):
+    """
+    将EMA参数（教师模型）加载到实际模型中，用于评估。
+    """
+    # 1. 获取模型当前的状态字典
+    model_state_dict = model.state_dict()
+    
+    # 2. 遍历模型的命名参数和EMA参数列表
+    #    用EMA参数来填充一个新的状态字典
+    ema_state_dict = copy.deepcopy(model_state_dict)
+    for i, (name, param) in enumerate(model.named_parameters()):
+        # 确保我们只替换需要梯度的、被训练的参数
+        if param.requires_grad:
+            # 从ema_params列表中取出对应的EMA权重
+            ema_state_dict[name] = ema_params[i].detach()
+
+    # 3. 将填充好的EMA状态字典加载到模型中
+    model.load_state_dict(ema_state_dict)
+
+def is_dist_avail_and_initialized():
+    """
+    检查分布式环境是否可用且已初始化。
+    """
+    if not dist.is_available():
+        return False
+    if not dist.is_initialized():
+        return False
+    return True

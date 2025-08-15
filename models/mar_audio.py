@@ -9,13 +9,19 @@ from torch.utils.checkpoint import checkpoint
 
 from timm.models.vision_transformer import Block
 from models.diffloss import DiffLoss
+from util import misc
 
 def mask_by_order(mask_len, order, bsz, seq_len):
     """根据给定的顺序和长度创建掩码。"""
     masking = torch.zeros(bsz, seq_len, device=order.device)
-    # 确保 mask_len 是一个标量整数
-    mask_len_scalar = mask_len.long().item() if mask_len.numel() == 1 else mask_len.long()
-    masking = torch.scatter(masking, dim=-1, index=order[:, :mask_len_scalar], src=torch.ones(bsz, seq_len, device=order.device)).bool()
+    
+    # --- 关键修改点 1 ---
+    # 使用 .item() 将单元素Tensor转换为Python整数，确保切片操作有效
+    mask_len_as_int = mask_len.long().item()
+    
+    # 使用 scatter 根据顺序和长度填充掩码
+    index_to_mask = order[:, :mask_len_as_int]
+    masking = torch.scatter(masking, dim=-1, index=index_to_mask, src=torch.ones_like(index_to_mask, dtype=masking.dtype)).bool()
     return masking
 
 class MAR_Audio(nn.Module):
@@ -246,11 +252,21 @@ class MAR_Audio(nn.Module):
             
             z = z_uncond + cfg_scale * (z_cond - z_uncond)
 
+        # 确保 mask_len 的计算结果是一个标量
             mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
-            mask_len = torch.tensor([np.floor(seq_len * mask_ratio)], device=device)
-            mask_len = torch.max(torch.tensor([1.0], device=device), torch.min(mask.sum(dim=-1) - 1, mask_len))
+            # a. 计算目标长度，这是一个标量
+            target_mask_len = torch.tensor(np.floor(seq_len * mask_ratio), device=device) 
+            # b. 获取当前掩码长度，对于所有样本都一样，所以取第一个即可
+            current_mask_len = mask.sum(dim=-1)[0]
+            # c. 确保我们至少会揭开一个token
+            max_len = current_mask_len - 1 
+            # d. 确保至少保留一个被掩码的token（直到最后一步）
+            min_len = 1 if step < num_iter - 1 else 0
+            # e. 将目标长度限制在有效范围内，得到最终的标量 next_mask_len
+            next_mask_len = torch.clamp(target_mask_len, min=min_len, max=max_len)
+ 
 
-            mask_next = mask_by_order(mask_len, orders, bsz, seq_len)
+            mask_next = mask_by_order(next_mask_len, orders, bsz, seq_len)
             mask_to_pred = (mask.bool() ^ mask_next.bool())
             
             z_pred = z[mask_to_pred.nonzero(as_tuple=True)]

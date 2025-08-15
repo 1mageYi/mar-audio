@@ -118,7 +118,7 @@ def evaluate(model_without_ddp: torch.nn.Module, vae: torch.nn.Module, ema_param
         truncation=True,
         max_length=args.max_text_len,
         return_tensors='pt'
-    ).input_ids.to(model_without_ddp.device)
+    ).input_ids.to(args.device)
     
     text_features = text_encoder(input_ids=text_tokens).last_hidden_state
     text_features = text_features.mean(dim=1)
@@ -165,4 +165,5 @@ def evaluate(model_without_ddp: torch.nn.Module, vae: torch.nn.Module, ema_param
         model_without_ddp.load_state_dict(model_state_dict)
 
     model_without_ddp.train() # 切换回训练模式
-    torch.distributed.barrier()
+    if misc.is_dist_avail_and_initialized():
+        torch.distributed.barrier()

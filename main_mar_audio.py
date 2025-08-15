@@ -223,7 +223,7 @@ def main(args):
 
         if epoch % args.eval_freq == 0 or epoch + 1 == args.epochs:
             torch.cuda.empty_cache()
-            evaluate(model_without_ddp, vae, tokenizer, text_encoder, args, epoch, log_writer=log_writer)
+            evaluate(model_without_ddp, vae, ema_params=ema_params, tokenizer=tokenizer, text_encoder=text_encoder, args=args, epoch=epoch, log_writer=log_writer)
             torch.cuda.empty_cache()
 
     total_time = time.time() - start_time
