@@ -1,2 +1,7 @@
 pretrained_models
 test
+__pycache__
+dataset/__pycache__/
+diffusion/__pycache__/
+models/__pycache__/
+util/__pycache__/

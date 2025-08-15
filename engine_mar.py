@@ -29,7 +29,7 @@ def update_ema(target_params, source_params, rate=0.99):
         targ.detach().mul_(rate).add_(src, alpha=1 - rate)
 
 
-def train_one_epoch(model, vae,
+def train_one_epoch(model, vae, 
                     model_params, ema_params,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler,

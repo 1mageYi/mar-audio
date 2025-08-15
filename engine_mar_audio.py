@@ -25,7 +25,7 @@ def update_ema(target_params, source_params, rate=0.99):
     for targ, src in zip(target_params, source_params):
         targ.detach().mul_(rate).add_(src, alpha=1 - rate)
 
-def train_one_epoch(model: torch.nn.Module, vae: torch.nn.Module,
+def train_one_epoch(model: torch.nn.Module, vae: torch.nn.Module, text_encoder,
                     model_params: Iterable, ema_params: Iterable,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler,
@@ -40,28 +40,19 @@ def train_one_epoch(model: torch.nn.Module, vae: torch.nn.Module,
     optimizer.zero_grad()
 
     for data_iter_step, (audio_paths, text_tokens) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        # 调整学习率
-        if data_iter_step % args.accum_iter == 0:
-            lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
-
         text_tokens = text_tokens.to(device, non_blocking=True)
         
-        # --- VAE 编码 (On-the-fly) ---
-        # 注意: 这里的 VAE 处理是批量的，但 VAEWrapper 的实现是单个文件的。
-        # 你可能需要修改 VAEWrapper 来支持批量编码以提高效率。
-        # 这里为了演示，我们使用一个简单的循环。
         with torch.no_grad():
-            latents_list = []
-            for path in audio_paths:
-                # vae.encode 返回的已经是 latent
-                latent = vae.encode(path) 
-                latents_list.append(latent)
-            # 拼接成一个 batch
-            audio_latents = torch.cat(latents_list, dim=0).to(device)
+            audio_latents = vae.encode_batch(audio_paths).to(device)
+            # --- 关键：在这里进行文本编码 ---
+            # 使用 T5EncoderModel 获取 last_hidden_state，然后取平均
+            text_features = text_encoder(input_ids=text_tokens).last_hidden_state
+            text_features = text_features.mean(dim=1) # [B, T, D] -> [B, D]
 
-        # --- 模型前向传播 ---
         with torch.cuda.amp.autocast():
-            loss = model(audio_latents, text_tokens, uncond_prob=args.uncond_prob)
+            # 将 text_features 传入模型
+            loss = model(audio_latents, text_features, uncond_prob=args.uncond_prob)
+
 
         loss_value = loss.item()
         if not math.isfinite(loss_value):
@@ -93,7 +84,7 @@ def train_one_epoch(model: torch.nn.Module, vae: torch.nn.Module,
 
 
 @torch.no_grad()
-def evaluate(model_without_ddp: torch.nn.Module, vae: torch.nn.Module, ema_params: Iterable, tokenizer,
+def evaluate(model_without_ddp: torch.nn.Module, vae: torch.nn.Module, ema_params: Iterable, tokenizer, text_encoder,
              args, epoch: int, log_writer=None, use_ema=True):
     model_without_ddp.eval()
 
@@ -129,10 +120,13 @@ def evaluate(model_without_ddp: torch.nn.Module, vae: torch.nn.Module, ema_param
         return_tensors='pt'
     ).input_ids.to(model_without_ddp.device)
     
+    text_features = text_encoder(input_ids=text_tokens).last_hidden_state
+    text_features = text_features.mean(dim=1)
+
     # --- 生成音频潜码 ---
     start_time = time.time()
     sampled_latents = model_without_ddp.sample_tokens(
-        text_tokens=text_tokens,
+        text_features=text_features,
         num_iter=args.num_iter,
         cfg_scale=args.cfg_scale,
         temperature=args.temperature,

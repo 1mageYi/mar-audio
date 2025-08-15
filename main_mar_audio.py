@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
-from transformers import T5Tokenizer
+from transformers import T5Tokenizer, T5EncoderModel
 
 import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
@@ -36,7 +36,7 @@ def get_args_parser():
     parser.add_argument('--vae_ckpt_path', default="pretrained_models/vae/stable_audio_open_vae_weights.pth", type=str, help='Path to VAE checkpoint') #
 
     # Text Tokenizer parameters
-    parser.add_argument('--tokenizer_path', default='t5-base', type=str, help='Path or name of T5 tokenizer')
+    parser.add_argument('--tokenizer', default='t5-base', type=str, help='Path or name of T5 tokenizer')
     parser.add_argument('--max_text_len', default=128, type=int, help='Max length for text tokens')
 
     # Generation parameters
@@ -67,9 +67,10 @@ def get_args_parser():
     parser.add_argument('--temperature', default=1.0, type=float, help='Diffusion loss sampling temperature')
 
     # Dataset parameters
-    parser.add_argument('--data_path', default='./dummy_data.txt', type=str,
+    parser.add_argument('--metadata_path', default='./dummy_data.txt', type=str,
                         help='Path to a text file containing (audio_path, text) pairs, one per line, separated by a tab.')
-
+    parser.add_argument('--raw_data_path', default='./raw_data', type=str,
+                        help='Path to the directory containing raw audio files.')
     parser.add_argument('--output_dir', default='./output_dir_audio',
                         help='Path where to save, empty for no saving')
     parser.add_argument('--device', default='cuda',
@@ -113,7 +114,7 @@ def main(args):
     # === Setup VAE, Tokenizer ===
     print("Initializing VAE, Tokenizer...")
     vae = VAEWrapper(model_config_path=args.vae_config_path, model_ckpt_path=args.vae_ckpt_path, device=device) #
-    tokenizer = T5Tokenizer.from_pretrained(args.tokenizer_path, model_max_length=args.max_text_len)
+    tokenizer = T5Tokenizer.from_pretrained(args.tokenizer, model_max_length=args.max_text_len)
 
     # === Setup Dataset ===
     # This is a placeholder for your actual data loading.
@@ -121,24 +122,28 @@ def main(args):
     # path/to/audio1.wav	a dog is barking
     # path/to/audio2.wav	techno music with a heavy bassline
     print("Loading data...")
-    try:
-        with open(args.data_path, 'r', encoding='utf-8') as f:
-            audio_text_pairs = [line.strip().split('\t') for line in f]
-    except FileNotFoundError:
-        print(f"Warning: Data file not found at {args.data_path}. Using placeholder data.")
-        print("Please create a tab-separated file with audio paths and text prompts.")
-        # Create a dummy file for demonstration
-        with open(args.data_path, 'w') as f:
-            f.write("placeholder.wav\tthis is a test prompt\n")
-        if not os.path.exists("placeholder.wav"):
-            # Create a silent wav file
-            import soundfile as sf
-            sf.write("placeholder.wav", np.zeros(44100), 44100)
-        audio_text_pairs = [("placeholder.wav", "this is a test prompt")]
+    # try:
+    #     with open(args.data_path, 'r', encoding='utf-8') as f:
+    #         audio_text_pairs = [line.strip().split('\t') for line in f]
+    # except FileNotFoundError:
+    #     print(f"Warning: Data file not found at {args.data_path}. Using placeholder data.")
+    #     print("Please create a tab-separated file with audio paths and text prompts.")
+    #     # Create a dummy file for demonstration
+    #     with open(args.data_path, 'w') as f:
+    #         f.write("placeholder.wav\tthis is a test prompt\n")
+    #     if not os.path.exists("placeholder.wav"):
+    #         # Create a silent wav file
+    #         import soundfile as sf
+    #         sf.write("placeholder.wav", np.zeros(44100), 44100)
+    #     audio_text_pairs = [("placeholder.wav", "this is a test prompt")]
 
+    text_encoder = T5EncoderModel.from_pretrained(args.tokenizer).to(device)
+    # 2. 冻结文本编码器，我们不训练它
+    text_encoder.eval()
+    for param in text_encoder.parameters():
+        param.requires_grad = False
 
-    dataset_train = AudioTextDataset(data=audio_text_pairs, tokenizer=tokenizer, max_text_len=args.max_text_len)
-    print(dataset_train)
+    dataset_train = AudioTextDataset(csv_path=f'{args.metadata_path}/val.csv', audio_dir=args.raw_data_path, tokenizer=tokenizer, max_text_len=args.max_text_len)
 
     sampler_train = torch.utils.data.DistributedSampler(
         dataset_train, num_replicas=misc.get_world_size(), rank=misc.get_rank(), shuffle=True
@@ -156,7 +161,7 @@ def main(args):
     model = mar_audio_large(
         max_seq_len=args.max_seq_len,
         audio_embed_dim=args.audio_embed_dim,
-        vocab_size=tokenizer.vocab_size,
+        text_feature_dim=text_encoder.config.d_model, 
         diffloss_d=args.diffloss_d,
         diffloss_w=args.diffloss_w,
         num_sampling_steps=args.num_sampling_steps,
@@ -202,7 +207,7 @@ def main(args):
             data_loader_train.sampler.set_epoch(epoch)
         
         train_one_epoch(
-            model, vae,
+            model, vae, text_encoder,
             model_params, ema_params,
             data_loader_train,
             optimizer, device, epoch, loss_scaler,
@@ -218,7 +223,7 @@ def main(args):
 
         if epoch % args.eval_freq == 0 or epoch + 1 == args.epochs:
             torch.cuda.empty_cache()
-            evaluate(model_without_ddp, vae, tokenizer, args, epoch, log_writer=log_writer)
+            evaluate(model_without_ddp, vae, tokenizer, text_encoder, args, epoch, log_writer=log_writer)
             torch.cuda.empty_cache()
 
     total_time = time.time() - start_time
