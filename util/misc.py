@@ -305,27 +305,33 @@ def add_weight_decay(model, weight_decay=1e-5, skip_list=()):
 def load_model(args, model_without_ddp, optimizer, loss_scaler, ema_params):
     """
     从检查点加载模型状态，用于恢复训练。
+    (已更新以处理 PyTorch 2.6+ 的 torch.load 安全策略)
     """
     if args.resume:
-        checkpoint_path = os.path.join(args.resume, "checkpoints", "checkpoint-last.pth")
+        checkpoint_path = os.path.join(args.resume, "checkpoint-last.pth")
+        
         if os.path.isfile(checkpoint_path):
             print(f"Resuming from checkpoint: {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            
+            checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
-            # 加载模型权重
+            # 加载学生模型权重
             model_without_ddp.load_state_dict(checkpoint['model'])
             print("Successfully loaded model weights.")
 
-            # 加载EMA权重
-            if 'model_ema' in checkpoint:
-                ema_state_dict = checkpoint['model_ema']
-                # 确保ema_params列表被正确更新
-                for i, (name, _value) in enumerate(model_without_ddp.named_parameters()):
-                     if name in ema_state_dict and _value.requires_grad:
-                         ema_params[i].copy_(ema_state_dict[name])
-                print("Successfully loaded EMA params.")
+            # --- 关键修复点 ---
+            # 使用 `with torch.no_grad():` 来安全地执行原地操作
+            with torch.no_grad():
+                # 加载教师模型 (EMA) 权重
+                if 'model_ema' in checkpoint:
+                    ema_state_dict = checkpoint['model_ema']
+                    for i, (name, param) in enumerate(model_without_ddp.named_parameters()):
+                        if param.requires_grad and name in ema_state_dict:
+                            # 这个 in-place copy_ 操作现在是安全的
+                            ema_params[i].copy_(ema_state_dict[name])
+                    print("Successfully loaded EMA params.")
 
-            # 加载优化器和scaler状态
+            # 加载优化器、epoch 和 scaler 状态
             if 'optimizer' in checkpoint and 'epoch' in checkpoint:
                 optimizer.load_state_dict(checkpoint['optimizer'])
                 args.start_epoch = checkpoint['epoch'] + 1
@@ -339,6 +345,7 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler, ema_params):
             print(f"No checkpoint found at '{args.resume}', starting from scratch.")
     else:
         print("No resume path provided, starting from scratch.")
+
 
 def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler, ema_params=None, epoch_name=None):
     if epoch_name is None:

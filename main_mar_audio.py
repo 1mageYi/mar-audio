@@ -45,7 +45,8 @@ def get_args_parser():
     parser.add_argument('--cfg_scale', default=4.0, type=float, help="Classifier-free guidance scale")
     parser.add_argument('--uncond_prob', default=0.1, type=float, help='Probability of unconditional training for CFG')
     parser.add_argument('--eval_freq', type=int, default=20, help='Evaluation frequency')
-    parser.add_argument('--save_last_freq', type=int, default=5, help='Save last checkpoint frequency')
+    parser.add_argument('--save_last_freq', type=int, default=1, help='Save last checkpoint frequency')
+    parser.add_argument('--save_freq', type=int, default=5, help='Save checkpoint frequency')
     parser.add_argument('--evaluate', action='store_true', help='Perform evaluation only')
     parser.add_argument('--eval_bsz', type=int, default=4, help='Generation batch size for evaluation')
 
@@ -155,7 +156,7 @@ def main(args):
     for param in text_encoder.parameters():
         param.requires_grad = False
 
-    dataset_train = AudioTextDataset(csv_path=f'{args.metadata_path}/val.csv', audio_dir=args.raw_data_path, tokenizer=tokenizer, max_text_len=args.max_text_len)
+    dataset_train = AudioTextDataset(csv_path=f'{args.metadata_path}/train.csv', audio_dir=args.raw_data_path, tokenizer=tokenizer, max_text_len=args.max_text_len)
 
     sampler_train = torch.utils.data.DistributedSampler(
         dataset_train, num_replicas=misc.get_world_size(), rank=misc.get_rank(), shuffle=True
@@ -235,6 +236,12 @@ def main(args):
             misc.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                 loss_scaler=loss_scaler, epoch=epoch, ema_params=ema_params, epoch_name="last"
+            )
+        
+        if epoch % args.save_freq == 0 or epoch + 1 == args.epochs:
+            misc.save_model(
+                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+                loss_scaler=loss_scaler, epoch=epoch, ema_params=ema_params, epoch_name=f"epoch_{epoch}"
             )
 
         if epoch % args.eval_freq == 0 or epoch + 1 == args.epochs:
