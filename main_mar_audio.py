@@ -94,11 +94,23 @@ def get_args_parser():
 
 
 def main(args):
+
+    
     misc.init_distributed_mode(args)
+
+
     print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
     print("{}".format(args).replace(', ', ',\n'))
 
-    device = torch.device(args.device)
+    if args.distributed:
+        # torchrun automatically sets the LOCAL_RANK environment variable.
+        # misc.init_distributed_mode populates args.gpu with this rank.
+        print(f"Running in distributed mode with {misc.get_world_size()} processes.")
+        device = torch.device(args.gpu)
+        torch.cuda.set_device(device) # Set the active device for this process
+    else:
+        # 单卡模式保持不变
+        device = torch.device(args.device)
     seed = args.seed + misc.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -174,7 +186,11 @@ def main(args):
     print("Number of trainable parameters: {}M".format(n_params / 1e6))
 
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank])
+        # --- 关键修复点 2: 修改DDP初始化方式 ---
+        # 我们已经将模型 `model` 移动到了正确的设备上 (例如 cuda:0 或 cuda:1)。
+        # 因此，在初始化DDP时，我们不再需要传递 `device_ids`。
+        # DDP会自动使用模型所在的设备，这是更健壮的做法。
+        model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=False)
         model_without_ddp = model.module
 
     # === Setup Optimizer ===

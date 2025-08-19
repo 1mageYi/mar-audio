@@ -87,82 +87,82 @@ def train_one_epoch(model: torch.nn.Module, vae: torch.nn.Module, text_encoder,
 def evaluate(model_without_ddp: torch.nn.Module, vae: torch.nn.Module, ema_params: Iterable, tokenizer, text_encoder,
              args, epoch: int, log_writer=None, use_ema=True):
     model_without_ddp.eval()
-
-    # --- 切换到 EMA 参数进行评估 ---
-    if use_ema:
-        print("Switching to EMA model for evaluation...")
-        model_state_dict = copy.deepcopy(model_without_ddp.state_dict())
-        ema_state_dict = copy.deepcopy(model_without_ddp.state_dict())
-        # 需要一个函数来从 ema_params 列表构建 state_dict
-        # 假设 misc.load_ema_to_model 可以做到这一点
-        misc.load_ema_to_model(model_without_ddp, ema_params) # 你需要实现这个函数
-
-    # --- 准备评估用的文本提示 ---
-    eval_prompts = [
-        "A dog barking in the distance",
-        "The sound of a beautiful piano melody, calm and peaceful",
-        "Heavy rain hitting a window pane",
-        "A high-energy electronic dance music track with a strong bassline",
-        "Footsteps walking on gravel",
-    ]
-    # 限制评估样本数量
-    eval_prompts = eval_prompts[:args.num_eval_samples]
-    if len(eval_prompts) == 0:
-        print("No evaluation prompts provided or num_eval_samples is 0. Skipping evaluation.")
-        return
-
-    print(f"Generating {len(eval_prompts)} samples for evaluation...")
-    text_tokens = tokenizer(
-        eval_prompts,
-        padding='max_length',
-        truncation=True,
-        max_length=args.max_text_len,
-        return_tensors='pt'
-    ).input_ids.to(args.device)
-    
-    text_features = text_encoder(input_ids=text_tokens).last_hidden_state
-    text_features = text_features.mean(dim=1)
-
-    # --- 生成音频潜码 ---
-    start_time = time.time()
-    sampled_latents = model_without_ddp.sample_tokens(
-        text_features=text_features,
-        num_iter=args.num_iter,
-        cfg_scale=args.cfg_scale,
-        temperature=args.temperature,
-        progress=True
-    )
-    torch.cuda.synchronize()
-    end_time = time.time()
-    print(f"Generation took {end_time - start_time:.2f} seconds.")
-
-    # --- 解码并保存音频 ---
-    save_folder = os.path.join(args.output_dir, f"eval_epoch-{epoch}")
     if misc.is_main_process():
-        os.makedirs(save_folder, exist_ok=True)
+        # --- 切换到 EMA 参数进行评估 ---
+        if use_ema:
+            print("Switching to EMA model for evaluation...")
+            model_state_dict = copy.deepcopy(model_without_ddp.state_dict())
+            ema_state_dict = copy.deepcopy(model_without_ddp.state_dict())
+            # 需要一个函数来从 ema_params 列表构建 state_dict
+            # 假设 misc.load_ema_to_model 可以做到这一点
+            misc.load_ema_to_model(model_without_ddp, ema_params) # 你需要实现这个函数
 
-    for i, latent in enumerate(sampled_latents):
-        latent = latent.unsqueeze(0)  # Add batch dimension back
-        output_path = os.path.join(save_folder, f"sample_{i+1}_epoch{epoch}.wav")
-        # VAE 解码
-        vae.decode(latent, output_path)
+        # --- 准备评估用的文本提示 ---
+        eval_prompts = [
+            "A dog barking in the distance",
+            "The sound of a beautiful piano melody, calm and peaceful",
+            "Heavy rain hitting a window pane",
+            "A high-energy electronic dance music track with a strong bassline",
+            "Footsteps walking on gravel",
+        ]
+        # 限制评估样本数量
+        eval_prompts = eval_prompts[:args.num_eval_samples]
+        if len(eval_prompts) == 0:
+            print("No evaluation prompts provided or num_eval_samples is 0. Skipping evaluation.")
+            return
 
-    print(f"Evaluation samples saved to: {save_folder}")
+        print(f"Generating {len(eval_prompts)} samples for evaluation...")
+        text_tokens = tokenizer(
+            eval_prompts,
+            padding='max_length',
+            truncation=True,
+            max_length=args.max_text_len,
+            return_tensors='pt'
+        ).input_ids.to(args.device)
+        
+        text_features = text_encoder(input_ids=text_tokens).last_hidden_state
+        text_features = text_features.mean(dim=1)
 
-    # --- 音频评估指标 ---
-    # 图像的 FID/IS 在此不适用。对于音频，可以使用 Fréchet Audio Distance (FAD),
-    # CLAP score, 或其他基于分类器的指标。这些通常需要额外的设置和预训练模型。
-    # 这里我们只生成样本供主观评估。
-    if log_writer is not None:
-        # 假设你有一个函数可以计算 FAD
-        # fad_score = calculate_fad(save_folder, your_ground_truth_folder)
-        # log_writer.add_scalar('eval/fad', fad_score, epoch)
-        pass
+        # --- 生成音频潜码 ---
+        start_time = time.time()
+        sampled_latents = model_without_ddp.sample_tokens(
+            text_features=text_features,
+            num_iter=args.num_iter,
+            cfg_scale=args.cfg_scale,
+            temperature=args.temperature,
+            progress=True
+        )
+        torch.cuda.synchronize()
+        end_time = time.time()
+        print(f"Generation took {end_time - start_time:.2f} seconds.")
 
-    # --- 切换回原始模型参数 ---
-    if use_ema:
-        print("Switching back from EMA model.")
-        model_without_ddp.load_state_dict(model_state_dict)
+        # --- 解码并保存音频 ---
+        save_folder = os.path.join(args.output_dir, f"eval_epoch-{epoch}")
+        if misc.is_main_process():
+            os.makedirs(save_folder, exist_ok=True)
+
+        for i, latent in enumerate(sampled_latents):
+            latent = latent.unsqueeze(0)  # Add batch dimension back
+            output_path = os.path.join(save_folder, f"sample_{i+1}_epoch{epoch}.wav")
+            # VAE 解码
+            vae.decode(latent, output_path)
+
+        print(f"Evaluation samples saved to: {save_folder}")
+
+        # --- 音频评估指标 ---
+        # 图像的 FID/IS 在此不适用。对于音频，可以使用 Fréchet Audio Distance (FAD),
+        # CLAP score, 或其他基于分类器的指标。这些通常需要额外的设置和预训练模型。
+        # 这里我们只生成样本供主观评估。
+        if log_writer is not None:
+            # 假设你有一个函数可以计算 FAD
+            # fad_score = calculate_fad(save_folder, your_ground_truth_folder)
+            # log_writer.add_scalar('eval/fad', fad_score, epoch)
+            pass
+
+        # --- 切换回原始模型参数 ---
+        if use_ema:
+            print("Switching back from EMA model.")
+            model_without_ddp.load_state_dict(model_state_dict)
 
     model_without_ddp.train() # 切换回训练模式
     if misc.is_dist_avail_and_initialized():
