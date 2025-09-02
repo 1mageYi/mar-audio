@@ -44,8 +44,9 @@ class DiffLoss(nn.Module):
             model_kwargs = dict(c=z)
             sample_fn = self.net.forward
 
+        # Debug V2: clip_denoised=True
         sampled_token_latent = self.gen_diffusion.p_sample_loop(
-            sample_fn, noise.shape, noise, clip_denoised=False, model_kwargs=model_kwargs, progress=False,
+            sample_fn, noise.shape, noise, clip_denoised=True, model_kwargs=model_kwargs, progress=False,
             temperature=temperature
         )
 

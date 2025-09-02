@@ -89,6 +89,12 @@ class MAR_Audio(nn.Module):
             Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer) for _ in range(decoder_depth)])
 
         self.decoder_norm = norm_layer(decoder_embed_dim)
+
+        # # --- 关键修复点 1: 添加一个新的输出归一化层 ---
+        # # 这个层将稳定送往 Diffusion Head 的条件向量
+        # self.decoder_out_norm = norm_layer(decoder_embed_dim)
+        # # ---------------------------------------------
+
         self.diffusion_pos_embed_learned = nn.Parameter(torch.zeros(1, self.max_seq_len, decoder_embed_dim))
 
         self.initialize_weights()
@@ -179,6 +185,11 @@ class MAR_Audio(nn.Module):
 
         x = x[:, self.buffer_size:]
         x = x + self.diffusion_pos_embed_learned[:, :seq_len, :]
+
+        # # --- 关键修复点 2: 在返回前，对输出进行归一化 ---
+        # x = self.decoder_out_norm(x)
+        # # ------------------------------------------------
+
         return x
 
     def forward_loss(self, z, target, mask):

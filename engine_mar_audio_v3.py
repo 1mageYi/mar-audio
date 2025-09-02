@@ -47,7 +47,7 @@ def train_one_epoch(model: torch.nn.Module, vae: torch.nn.Module, text_encoder,
             # --- 关键：在这里进行文本编码 ---
             # 使用 T5EncoderModel 获取 last_hidden_state，然后取平均
             text_features = text_encoder(input_ids=text_tokens).last_hidden_state
-            text_features = text_features.mean(dim=1) # [B, T, D] -> [B, D]
+            
 
         # --- 关键调试点 1: 检查输入数据 ---
         # 我们只在第一个step和主进程打印，避免刷屏
@@ -150,7 +150,7 @@ def evaluate(model_without_ddp: torch.nn.Module, vae: torch.nn.Module, ema_param
         ).input_ids.to(args.device)
         
         text_features = text_encoder(input_ids=text_tokens).last_hidden_state
-        text_features = text_features.mean(dim=1)
+        # text_features = text_features.mean(dim=1)
 
         # --- 生成音频潜码 ---
         start_time = time.time()

@@ -15,8 +15,8 @@ import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 from dataset.dataset_audio import AudioTextDataset, Dataset # <-- 导入新的数据集类
 from models.vae_audio import VAEWrapper # <-- 导入你的 VAE Wrapper
-from models.mar_audio import mar_audio_large # <-- 导入新的音频MAR模型
-from engine_mar_audio import train_one_epoch, evaluate # <-- 导入新的引擎
+from models.mar_audio_v3 import mar_audio_large, mar_audio_base # <-- 导入新的音频MAR模型
+from engine_mar_audio_v3 import train_one_epoch, evaluate # <-- 导入新的引擎
 import copy
 
 def get_args_parser():
@@ -202,7 +202,7 @@ def main(args):
 
     # === Setup Model ===
     print(f"Creating model: {args.model}")
-    model = mar_audio_large(
+    model = mar_audio_base(
         max_seq_len=args.max_seq_len,
         audio_embed_dim=args.audio_embed_dim,
         text_feature_dim=text_encoder.config.d_model, 
